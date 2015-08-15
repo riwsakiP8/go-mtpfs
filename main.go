@@ -6,22 +6,28 @@ package main
 
 import (
 	"flag"
-	"io/ioutil"
 	"log"
 	"os"
-	"regexp"
+	"strings"
+	"sync"
 
 	"github.com/hanwen/go-fuse/fuse"
+	"github.com/hanwen/go-fuse/fuse/nodefs"
+	"github.com/hanwen/go-mtpfs/fs"
+	"github.com/hanwen/go-mtpfs/mtp"
 )
 
 func main() {
-	fsdebug := flag.Bool("fs-debug", false, "switch on FS debugging")
-	mtpDebug := flag.Int("mtp-debug", 0, "switch on MTP debugging. 1=PTP, 2=PLST, 4=USB, 8=DATA")
-	backing := flag.String("backing-dir", "", "backing store for locally cached files. Default: use a temporary directory.")
+	debug := flag.String("debug", "", "comma-separated list of debugging options: usb, data, mtp, fuse")
+	usbTimeout := flag.Int("usb-timeout", 5000, "timeout in milliseconds")
 	vfat := flag.Bool("vfat", true, "assume removable RAM media uses VFAT, and rewrite names.")
 	other := flag.Bool("allow-other", false, "allow other users to access mounted fuse. Default: false.")
-	deviceFilter := flag.String("dev", "", "regular expression to filter devices.")
+	deviceFilter := flag.String("dev", "",
+		"regular expression to filter device IDs, "+
+			"which are composed of manufacturer/product/serial.")
 	storageFilter := flag.String("storage", "", "regular expression to filter storage areas.")
+	android := flag.Bool("android", true, "use android extensions if available")
+	skipNullRead := flag.Bool("skip-null-read", false, "skip null reads. Workaround for Linux xhci bug.")
 	flag.Parse()
 
 	if len(flag.Args()) != 1 {
@@ -29,120 +35,58 @@ func main() {
 	}
 	mountpoint := flag.Arg(0)
 
-	Init()
-	SetDebug(*mtpDebug)
-	devs, err := Detect()
+	dev, err := mtp.SelectDevice(*deviceFilter)
 	if err != nil {
 		log.Fatalf("detect failed: %v", err)
 	}
-
-	if *deviceFilter != "" {
-		re, err := regexp.Compile(*deviceFilter)
-		if err != nil {
-			log.Fatalf("invalid regexp %q: %v", *deviceFilter, err)
-		}
-		filtered := []*RawDevice{}
-		for _, d := range devs {
-			if re.FindStringIndex(d.String()) != nil { 
-				filtered = append(filtered, d)
-			} else {
-				log.Printf("filtering out device %v: ", d)
-			}
-		}
-		devs = filtered
-	} else {
-		for _, d := range devs {
-			log.Printf("found device %v: ", d)
-		}
+	defer dev.Close()
+	debugs := map[string]bool{}
+	for _, s := range strings.Split(*debug, ",") {
+		debugs[s] = true
 	}
-	
-	if len(devs) == 0 {
-		log.Fatal("no device found.  Try replugging it.")
-	}
-	if len(devs) > 1 {
-		log.Fatal("must have exactly one device. Try using -dev")
+	dev.MTPDebug = debugs["mtp"]
+	dev.DataDebug = debugs["data"]
+	dev.USBDebug = debugs["usb"]
+	dev.Timeout = *usbTimeout
+	dev.SkipNullRead = *skipNullRead
+	if err = dev.Configure(); err != nil {
+		log.Fatalf("Configure failed: %v", err)
 	}
 
-	rdev := devs[0]
-
-	dev, err := rdev.Open()
+	sids, err := fs.SelectStorages(dev, *storageFilter)
 	if err != nil {
-		log.Fatalf("rdev.open failed: %v", err)
-	}
-	defer dev.Release()
-	dev.GetStorage(0)
-	
-	storages := []*DeviceStorage{}
-	for _, s := range dev.ListStorage()  {
-		if !s.IsHierarchical() {
-			log.Printf("skipping non hierarchical storage %q", s.Description())
-			continue
-		}
-		storages = append(storages, s)
-	}
-	
-	if *storageFilter != "" {
-		re, err := regexp.Compile(*storageFilter)
-		if err != nil {
-			log.Fatalf("invalid regexp %q: %v", *storageFilter, err)
-		}
-		
-		filtered := []*DeviceStorage{}
-		for _, s := range storages {
-			if re.FindStringIndex(s.Description()) == nil {
-				log.Printf("filtering out storage %q", s.Description())
-				continue
-			}
-			filtered = append(filtered, s)
-		}
-
-		if len(filtered) == 0 {
-			log.Fatalf("No storages found. Try changing the -storage flag.")
-		}
-		storages = filtered
-	} else {
-		for _, s := range storages {
-			log.Printf("storage ID %d: %s", s.Id(), s.Description())
-		}
+		log.Fatalf("selectStorages failed: %v", err)
 	}
 
-	if len(storages) == 0 {
-		log.Fatalf("No storages found. Try unlocking the device.")		
-	}
-
-	if *backing == "" {
-		*backing, err = ioutil.TempDir("", "go-mtpfs")
-		if err != nil {
-			log.Fatalf("TempDir failed: %v", err)
-		}
-	} else {
-		*backing = *backing + "/go-mtpfs"
-		err = os.Mkdir(*backing, 0700)
-		if err != nil {
-			log.Fatalf("Mkdir failed: %v", err)
-		}
-	}
-	log.Println("backing data", *backing)
-	defer os.RemoveAll(*backing)
-
-	opts := DeviceFsOptions{
-		Dir:           *backing,
+	opts := fs.DeviceFsOptions{
 		RemovableVFat: *vfat,
+		Android:       *android,
 	}
-	fs := NewDeviceFs(dev, storages, opts)
-	conn := fuse.NewFileSystemConnector(fs, fuse.NewFileSystemOptions())
-	rawFs := fuse.NewLockingRawFileSystem(conn)
+	root, err := fs.NewDeviceFSRoot(dev, sids, opts)
+	if err != nil {
+		log.Fatalf("NewDeviceFs failed: %v", err)
+	}
+	conn := nodefs.NewFileSystemConnector(root, nodefs.NewOptions())
+	rawFs := fuse.NewLockingRawFileSystem(conn.RawFS())
 
-	mount := fuse.NewMountState(rawFs)
 	mOpts := &fuse.MountOptions{
 		AllowOther: *other,
 	}
-	if err := mount.Mount(mountpoint, mOpts); err != nil {
+	mount, err := fuse.NewServer(rawFs, mountpoint, mOpts)
+	if err != nil {
 		log.Fatalf("mount failed: %v", err)
 	}
 
-	conn.Debug = *fsdebug
-	mount.Debug = *fsdebug
-	log.Printf("starting FUSE %v", fuse.Version())
-	mount.Loop()
+	conn.SetDebug(debugs["fuse"] || debugs["fs"])
+	mount.SetDebug(debugs["fuse"] || debugs["fs"])
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		mount.Serve()
+		wg.Done()
+	}()
+	mount.WaitMount()
+	log.Printf("FUSE mounted")
+	wg.Wait()
+	root.OnUnmount()
 }
